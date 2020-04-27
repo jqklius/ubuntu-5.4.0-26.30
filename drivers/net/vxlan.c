@@ -1861,7 +1861,7 @@ static int vxlan_rcv(struct sock *sk, struct sk_buff *skb)
 				   !net_eq(vxlan->net, dev_net(vxlan->dev))))
 			goto drop;
 
-	if (vxlan_collect_metadata(vs)) {
+	if (vxlan_collect_metadata(vs) || (vxlan->cfg.flags & VXLAN_F_TUNNEL_INFO)) {
 		struct metadata_dst *tun_dst;
 
 		tun_dst = udp_tun_rx_dst(skb, vxlan_get_sk_family(vs), TUNNEL_KEY,
@@ -3291,6 +3291,7 @@ static const struct nla_policy vxlan_policy[IFLA_VXLAN_MAX + 1] = {
 	[IFLA_VXLAN_REMCSUM_NOPARTIAL]	= { .type = NLA_FLAG },
 	[IFLA_VXLAN_TTL_INHERIT]	= { .type = NLA_FLAG },
 	[IFLA_VXLAN_DF]		= { .type = NLA_U8 },
+        [IFLA_VXLAN_TUNNEL_INFO]	= { .type = NLA_U8 },
 };
 
 static int vxlan_validate(struct nlattr *tb[], struct nlattr *data[],
@@ -4028,6 +4029,13 @@ static int vxlan_nl2conf(struct nlattr *tb[], struct nlattr *data[],
 			return err;
 	}
 
+	if (data[IFLA_VXLAN_TUNNEL_INFO]) {
+		if (changelink)
+			return -EOPNOTSUPP;
+		if (nla_get_u8(data[IFLA_VXLAN_TUNNEL_INFO]))
+			conf->flags |= VXLAN_F_TUNNEL_INFO;
+	}
+
 	if (data[IFLA_VXLAN_PORT_RANGE]) {
 		if (!changelink) {
 			const struct ifla_vxlan_port_range *p
@@ -4256,6 +4264,8 @@ static size_t vxlan_get_size(const struct net_device *dev)
 		nla_total_size(sizeof(__u8)) + /* IFLA_VXLAN_REMCSUM_TX */
 		nla_total_size(sizeof(__u8)) + /* IFLA_VXLAN_REMCSUM_RX */
 		nla_total_size(sizeof(struct ip_fan_map) * 256) +
+		nla_total_size(sizeof(__u8)) +	/* IFLA_VXLAN_TUNNEL_INFO */
+
 		0;
 }
 
@@ -4340,6 +4350,8 @@ static int vxlan_fill_info(struct sk_buff *skb, const struct net_device *dev)
 			!!(vxlan->cfg.flags & VXLAN_F_L3MISS)) ||
 	    nla_put_u8(skb, IFLA_VXLAN_COLLECT_METADATA,
 		       !!(vxlan->cfg.flags & VXLAN_F_COLLECT_METADATA)) ||
+            nla_put_u8(skb, IFLA_VXLAN_TUNNEL_INFO,
+		       !!(vxlan->cfg.flags & VXLAN_F_TUNNEL_INFO)) ||
 	    nla_put_u32(skb, IFLA_VXLAN_AGEING, vxlan->cfg.age_interval) ||
 	    nla_put_u32(skb, IFLA_VXLAN_LIMIT, vxlan->cfg.addrmax) ||
 	    nla_put_be16(skb, IFLA_VXLAN_PORT, vxlan->cfg.dst_port) ||

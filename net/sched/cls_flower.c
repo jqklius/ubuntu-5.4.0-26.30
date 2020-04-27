@@ -27,6 +27,8 @@
 #include <net/dst_metadata.h>
 
 #include <uapi/linux/netfilter/nf_conntrack_common.h>
+#include <net/tc_act/tc_gact.h>
+
 
 struct fl_flow_key {
 	struct flow_dissector_key_meta meta;
@@ -293,6 +295,26 @@ static u16 fl_ct_info_to_flower_map[] = {
 					TCA_FLOWER_KEY_CT_FLAGS_NEW,
 };
 
+static void fl_notify_underlying_device(struct sk_buff *skb, const struct tcf_proto *tp,
+					struct cls_fl_filter *f)
+{
+	struct tcf_block *block = tp->chain->block;
+	struct tc_action **actions = f->exts.actions;
+	int nr_actions = f->exts.nr_actions;
+	struct tc_miniflow_offload mf;
+
+	WARN_ON(nr_actions < 1);
+
+	mf.skb = skb;
+	mf.cookie = tc_in_hw(f->flags) ? (unsigned long) f : 0;
+	mf.last_flow = !is_tcf_gact_goto_chain(actions[nr_actions-1]);
+	mf.is_drop = is_tcf_gact_shot(actions[nr_actions-1]);
+	mf.chain_index = tp->chain->index;
+
+	/* TODO: should be replaced by something else TBD */
+	tc_setup_cb_call_all(block, TC_SETUP_MINIFLOW, &mf);
+}
+
 static int fl_classify(struct sk_buff *skb, const struct tcf_proto *tp,
 		       struct tcf_result *res)
 {
@@ -321,6 +343,7 @@ static int fl_classify(struct sk_buff *skb, const struct tcf_proto *tp,
 
 		f = fl_lookup(mask, &skb_mkey, &skb_key);
 		if (f && !tc_skip_sw(f->flags)) {
+                        fl_notify_underlying_device(skb, tp, f);
 			*res = f->res;
 			return tcf_exts_exec(skb, &f->exts, res);
 		}
@@ -447,6 +470,10 @@ static int fl_hw_replace_filter(struct tcf_proto *tp,
 	cls_flower.rule->match.mask = &f->mask->key;
 	cls_flower.rule->match.key = &f->mkey;
 	cls_flower.classid = f->res.classid;
+
+        // copy from 4.20.16
+        cls_flower.ct_state_key = f->mkey.ct.ct_state;
+        cls_flower.ct_state_mask = f->mask->key.ct.ct_state;
 
 	err = tc_setup_flow_action(&cls_flower.rule->action, &f->exts,
 				   rtnl_held);

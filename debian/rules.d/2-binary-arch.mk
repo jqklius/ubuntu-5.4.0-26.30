@@ -528,7 +528,7 @@ define dh_all
 	dh_installdocs -p$(1)
 	dh_compress -p$(1)
 	dh_fixperms -p$(1) -X/boot/
-	dh_shlibdeps -p$(1) $(shlibdeps_opts)
+	dh_shlibdeps --dpkg-shlibdeps-params=--ignore-missing-info -p$(1) $(shlibdeps_opts)
 	dh_installdeb -p$(1)
 	dh_installdebconf -p$(1)
 	$(lockme) dh_gencontrol -p$(1) -- -Vlinux:rprovides='$(rprovides)'

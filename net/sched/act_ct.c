@@ -30,6 +30,7 @@
 #include <net/netfilter/nf_conntrack_helper.h>
 #include <net/netfilter/ipv6/nf_defrag_ipv6.h>
 #include <uapi/linux/netfilter/nf_nat.h>
+#include <net/netfilter/nf_conntrack_timeout.h>
 
 static struct tc_action_ops act_ct_ops;
 static unsigned int ct_net_id;
@@ -376,6 +377,203 @@ static int tcf_ct_act_nat(struct sk_buff *skb,
 #endif
 }
 
+static void ct_parse_nat(struct tc_ct_offload *cto,
+			 int ct_action,
+			 struct nf_conn *ct,
+			 enum ip_conntrack_info ctinfo)
+{
+	struct nf_conntrack_tuple target;
+	unsigned long nat = 0;
+
+	if (!(ct_action & TCA_CT_ACT_NAT))
+		return;
+
+	if (!(ct->status & IPS_NAT_MASK))
+		return;
+
+	if (ct_action & TCA_CT_ACT_NAT_SRC) {
+		nat = IPS_SRC_NAT;
+	} else if (ct_action & TCA_CT_ACT_NAT_DST) {
+		nat = IPS_DST_NAT;
+	} else {
+		if (CTINFO2DIR(ctinfo) == IP_CT_DIR_REPLY)
+			nat = ct->status & IPS_SRC_NAT ?
+			      IPS_DST_NAT : IPS_SRC_NAT;
+		else
+			nat = ct->status & IPS_SRC_NAT ?
+			      IPS_SRC_NAT : IPS_DST_NAT;
+	}
+
+	/* We are aiming to look like inverse of other direction. */
+	nf_ct_invert_tuple(&target, nf_ct_tuple(ct, !CTINFO2DIR(ctinfo)));
+
+	if (nat & IPS_SRC_NAT) {
+		cto->ipv4 = target.src.u3.ip;
+		cto->port = target.src.u.all;
+	}
+
+	if (nat & IPS_DST_NAT) {
+		cto->ipv4 = target.dst.u3.ip;
+		cto->port = target.dst.u.all;
+	}
+
+	cto->proto = target.dst.protonum;
+	cto->nat = nat;
+        return;
+}
+
+static void ct_notify_underlying_device(struct sk_buff *skb,
+					struct tcf_ct *ca,
+					struct nf_conn *ct,
+					enum ip_conntrack_info ctinfo,
+					struct net *net)
+{
+	struct tc_ct_offload cto = { skb, net, NULL, NULL };
+
+	if (ct) {
+		cto.zone = (struct nf_conntrack_zone *)nf_ct_zone(ct);
+		cto.tuple = nf_ct_tuple(ct, CTINFO2DIR(ctinfo));
+
+		ct_parse_nat(&cto, ca->params->ct_action, ct, ctinfo);
+	}
+	tc_setup_cb_call_all(NULL, TC_SETUP_CT, &cto);
+}
+
+static void tcf_ct_flow_table_process_conn(struct sk_buff *skb,
+                                           struct tcf_ct *ca,
+					   struct nf_conn *ct,
+					   enum ip_conntrack_info ctinfo)
+{
+	bool tcp = false;
+
+	if (ctinfo != IP_CT_ESTABLISHED && ctinfo != IP_CT_ESTABLISHED_REPLY)
+		return;
+
+	switch (nf_ct_protonum(ct)) {
+	case IPPROTO_TCP:
+		tcp = true;
+		if (ct->proto.tcp.state != TCP_CONNTRACK_ESTABLISHED)
+			return;
+		break;
+	case IPPROTO_UDP:
+		break;
+	default:
+		return;
+	}
+
+	if (nf_ct_ext_exist(ct, NF_CT_EXT_HELPER) ||
+	    ct->status & IPS_SEQ_ADJUST)
+		return;
+
+            // should not include dying
+            if(!nf_ct_is_dying(ct)) {
+                     if (ctinfo == IP_CT_ESTABLISHED ||
+                            ctinfo == IP_CT_ESTABLISHED_REPLY)
+                     {
+                            /* TODO: I'm not sure if that "cached" thing affects NAT? */
+                            struct net *net = dev_net(skb->dev);
+                            ct_notify_underlying_device(skb, ca, ct, ctinfo, net);
+                    }
+            }
+
+}
+
+static bool tcf_attach_exist_nf_ct_info(struct sk_buff *skb, struct tcf_ct *ca)
+{
+	const struct nf_conntrack_tuple_hash *thash;
+	struct nf_conntrack_tuple tuple;
+	enum ip_conntrack_info ctinfo;
+	struct nf_conntrack_zone zone;
+	struct nf_conn *ct;
+	int proto;
+
+        struct net *net = dev_net(skb->dev);
+         bool is_fin_rst = false;
+         if (skb->protocol == htons(ETH_P_IP)) {
+		if (skb->len < sizeof(struct iphdr)) {
+			goto out;
+                 }
+		proto = NFPROTO_IPV4;
+
+                unsigned int thoff;
+                struct iphdr *iph;
+
+                iph = ip_hdr(skb);
+                thoff = iph->ihl * 4;
+
+                if (!ip_is_fragment(iph) &&
+                    unlikely(thoff  == sizeof(struct iphdr))) {
+
+                    if (iph->protocol == IPPROTO_TCP) {
+                        struct tcphdr *tcph = (void *)(skb_network_header(skb) + thoff);
+                        if(tcph->fin || tcph->rst) {
+                                is_fin_rst = true;
+                        }
+                    }
+                }
+	} else if (skb->protocol == htons(ETH_P_IPV6)) {
+		if (skb->len < sizeof(struct ipv6hdr))
+			goto out;
+
+		proto = NFPROTO_IPV6;
+	} else {
+		goto out;
+	}
+
+	ct = nf_ct_get(skb, &ctinfo);
+	if (!ct) {
+                if (!nf_ct_get_tuplepr(skb, skb_network_offset(skb),
+                               proto, net, &tuple)) {
+                    goto out;
+                }
+
+                zone.id = ca->params->zone;
+                zone.dir = NF_CT_DEFAULT_ZONE_DIR;
+                thash = nf_conntrack_find_get(net, &zone, &tuple);
+                if (!thash) {
+                    goto out;
+                }
+
+                ct = nf_ct_tuplehash_to_ctrack(thash);
+                /* It exists; we have (non-exclusive) reference. */
+                if (NF_CT_DIRECTION(thash) == IP_CT_DIR_REPLY) {
+                    ctinfo = IP_CT_ESTABLISHED_REPLY;
+                } else {
+                    /* Once we've had two way comms, always ESTABLISHED. */
+                    if (test_bit(IPS_SEEN_REPLY_BIT, &ct->status)) {
+                        ctinfo = IP_CT_ESTABLISHED;
+                    } else if (test_bit(IPS_EXPECTED_BIT, &ct->status)) {
+                        ctinfo = IP_CT_RELATED;
+                    } else {
+                        ctinfo = IP_CT_NEW;
+                    }
+                }
+                nf_ct_set(skb, ct, ctinfo);
+
+                if(is_fin_rst) {
+                    struct net *net = nf_ct_net(ct);
+                    unsigned int *timeouts;
+                    unsigned int timeout;
+                    timeouts = nf_ct_timeout_lookup(ct);
+                    if(!timeouts){
+                        struct nf_tcp_net *tn = nf_tcp_pernet(net);
+                        timeouts = tn->timeouts;
+                    }
+
+                    ct->proto.tcp.state = TCP_CONNTRACK_FIN_WAIT;
+                    timeout = timeouts[ct->proto.tcp.state];
+                    ct->timeout = ((u32)(jiffies)) + timeout;
+                }
+        }
+
+        if (ct) {
+                return true;
+        }
+
+out:
+	return false;
+}
+
 static int tcf_ct_act(struct sk_buff *skb, const struct tc_action *a,
 		      struct tcf_result *res)
 {
@@ -451,6 +649,11 @@ static int tcf_ct_act(struct sk_buff *skb, const struct tc_action *a,
 		err = nf_conntrack_in(skb, &state);
 		if (err != NF_ACCEPT)
 			goto out_push;
+
+        // maybe last pkt is sent by hw, 
+        //then nf_conntrack_in will not attach ct to skb;
+        // so attach here
+        tcf_attach_exist_nf_ct_info(skb, c);
 	}
 
 	ct = nf_ct_get(skb, &ctinfo);
@@ -471,6 +674,10 @@ static int tcf_ct_act(struct sk_buff *skb, const struct tc_action *a,
 		 */
 		nf_conntrack_confirm(skb);
 	}
+
+        // copy from 5.5
+	tcf_ct_flow_table_process_conn(skb, c, ct, ctinfo);
+
 
 out_push:
 	skb_push_rcsum(skb, nh_ofs);
