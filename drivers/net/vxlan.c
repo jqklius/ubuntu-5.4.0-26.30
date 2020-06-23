@@ -33,7 +33,7 @@
 #include <net/ip6_checksum.h>
 #endif
 
-#define VXLAN_VERSION	"0.1"
+#define VXLAN_VERSION	"0.1.3"
 
 #define PORT_HASH_BITS	8
 #define PORT_HASH_SIZE  (1<<PORT_HASH_BITS)
