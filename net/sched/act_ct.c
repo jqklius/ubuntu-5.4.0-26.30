@@ -650,7 +650,7 @@ static int tcf_ct_act(struct sk_buff *skb, const struct tc_action *a,
 		if (err != NF_ACCEPT)
 			goto out_push;
 
-        // maybe last pkt is sent by hw, 
+        // maybe last pkt is sent by hw
         //then nf_conntrack_in will not attach ct to skb;
         // so attach here
         tcf_attach_exist_nf_ct_info(skb, c);
